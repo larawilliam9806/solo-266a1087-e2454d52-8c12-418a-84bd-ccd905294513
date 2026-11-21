@@ -358,61 +358,90 @@ class BulletinService:
                  token_id: int | None) -> dict[str, Any]:
         from .db import connect
 
+        # Phase 1: read the detail snapshot and validate the requested cells.
+        # No write transaction is open here, so this read never blocks other
+        # quarters (or this one) from submitting details or saving masks.
+        conn = connect(self.db_path)
+        try:
+            self._quarter_row(conn, quarter)
+            latest = self._latest_detail(conn, quarter)
+            if latest is None:
+                raise ApiError(409, "detail_required",
+                               "submit a detail version before masking")
+            if body.detail_version is not None and \
+                    body.detail_version != latest["version"]:
+                raise conflict(
+                    "stale_detail_version",
+                    "the mask targets an outdated detail version",
+                    {"submitted_for": body.detail_version,
+                     "current_detail_version": latest["version"]},
+                )
+            detail_version = latest["version"]
+            values = json.loads(latest["values_json"])
+            must_public = _cells(json.loads(latest["must_public"]))
+            n_rows, n_cols = len(values), len(values[0])
+            cells = _cells(body.cells)
+            for r, c in cells:
+                if not (0 <= r < n_rows and 0 <= c < n_cols):
+                    raise ApiError(422, "cell_out_of_range",
+                                   f"mask cell ({r},{c}) is outside the "
+                                   f"{n_rows}x{n_cols} table",
+                                   {"row": r, "col": c})
+
+            issues = []
+            for r, c in sorted(cells & must_public):
+                issues.append({"kind": "must_public_cell_masked",
+                               "row": r, "col": c,
+                               "message": "cell is required to be public"})
+            for r, c in sorted(suppression.sensitive_cells(values) - cells):
+                if (r, c) in must_public:
+                    continue
+                issues.append({
+                    "kind": "sensitive_cell_visible", "row": r, "col": c,
+                    "value": values[r][c],
+                    "message": "cells with 1-4 households must be masked",
+                })
+            if issues:
+                raise conflict(
+                    "mask_conflict",
+                    "the masking conflicts with the published rules",
+                    {
+                        "cells": self._cell_list(
+                            {(i["row"], i["col"]) for i in issues}
+                        ),
+                        "issues": issues,
+                    },
+                )
+        finally:
+            conn.close()
+
+        # Phase 2: the expensive, side-effect-free analysis runs with no
+        # SQLite lock held.  Other editors can keep working while it runs;
+        # phase 3 detects whether our snapshot is still current before
+        # anything is written.
+        analysis = suppression.analyze(values, cells, must_public)
+
+        # Phase 3: short write transaction.  The detail version read in phase 1
+        # must still be the latest even when the request omitted a version
+        # number; otherwise the mask would describe an obsolete detail and is
+        # rejected without writing anything.  Concurrent saves against the
+        # same detail version all succeed, each receiving the next version in
+        # write order.
         conn = connect(self.db_path)
         try:
             with transaction(conn):
                 self._quarter_row(conn, quarter)
                 latest = self._latest_detail(conn, quarter)
-                if latest is None:
-                    raise ApiError(409, "detail_required",
-                                   "submit a detail version before masking")
-                if body.detail_version is not None and \
-                        body.detail_version != latest["version"]:
+                current_version = latest["version"] if latest else None
+                if current_version != detail_version:
                     raise conflict(
                         "stale_detail_version",
-                        "the mask targets an outdated detail version",
-                        {"submitted_for": body.detail_version,
-                         "current_detail_version": latest["version"]},
+                        "the detail version changed while the masking was "
+                        "being analysed; reload and retry",
+                        {"analysed_detail_version": detail_version,
+                         "current_detail_version": current_version},
                     )
-
-                values = json.loads(latest["values_json"])
-                must_public = _cells(json.loads(latest["must_public"]))
-                n_rows, n_cols = len(values), len(values[0])
-                cells = _cells(body.cells)
-                for r, c in cells:
-                    if not (0 <= r < n_rows and 0 <= c < n_cols):
-                        raise ApiError(422, "cell_out_of_range",
-                                       f"mask cell ({r},{c}) is outside the "
-                                       f"{n_rows}x{n_cols} table",
-                                       {"row": r, "col": c})
-
-                issues = []
-                for r, c in sorted(cells & must_public):
-                    issues.append({"kind": "must_public_cell_masked",
-                                   "row": r, "col": c,
-                                   "message": "cell is required to be public"})
-                for r, c in sorted(suppression.sensitive_cells(values) - cells):
-                    if (r, c) in must_public:
-                        continue
-                    issues.append({
-                        "kind": "sensitive_cell_visible", "row": r, "col": c,
-                        "value": values[r][c],
-                        "message": "cells with 1-4 households must be masked",
-                    })
-                if issues:
-                    raise conflict(
-                        "mask_conflict",
-                        "the masking conflicts with the published rules",
-                        {
-                            "cells": self._cell_list(
-                                {(i["row"], i["col"]) for i in issues}
-                            ),
-                            "issues": issues,
-                        },
-                    )
-
-                analysis = suppression.analyze(values, cells, must_public)
-                previous = self._mask_row(conn, quarter, latest["version"])
+                previous = self._mask_row(conn, quarter, detail_version)
                 mask_version = (previous["mask_version"] + 1) if previous else 1
                 conn.execute(
                     "INSERT INTO mask_plans(quarter, detail_version, "
@@ -423,7 +452,7 @@ class BulletinService:
                     "updated_at=excluded.updated_at, "
                     "updated_by=excluded.updated_by",
                     (
-                        quarter, latest["version"], mask_version,
+                        quarter, detail_version, mask_version,
                         json.dumps(sorted([r, c] for r, c in cells)),
                         now(), token_id,
                     ),
@@ -431,8 +460,9 @@ class BulletinService:
         finally:
             conn.close()
 
-        state = self.get_admin_state(quarter)
+        state = self.get_admin_state(quarter, include_analysis=False)
         state["mask_version"] = mask_version
+        state["masked_cells"] = self._cell_list(cells)
         state["analysis"] = analysis.as_dict()
         state["preview"] = [issue.as_dict() for issue in analysis.issues]
         return state
@@ -489,10 +519,111 @@ class BulletinService:
                 token_id: int | None) -> dict[str, Any]:
         from .db import connect
 
+        # Phase 1: snapshot everything publication depends on with a plain
+        # read.  The (potentially expensive) suppression analysis in phase 2
+        # therefore never holds SQLite's database-wide write lock, so details
+        # and masks for other quarters -- and for this one -- stay editable
+        # while a publish is being reviewed.
+        conn = connect(self.db_path)
+        try:
+            q = self._quarter_row(conn, quarter)
+            existing = self._bulletin_row(conn, quarter)
+            if existing is not None:
+                raise conflict(
+                    "already_published",
+                    f"{quarter} already has a published bulletin; a quarter "
+                    f"is published exactly once",
+                    {"quarter": quarter,
+                     "published_at": existing["published_at"],
+                     "detail_version": existing["detail_version"]},
+                )
+            latest = self._latest_detail(conn, quarter)
+            if latest is None:
+                raise ApiError(409, "detail_required",
+                               "submit a detail version before publishing")
+            if body.detail_version is not None and \
+                    body.detail_version != latest["version"]:
+                raise conflict(
+                    "stale_detail_version",
+                    "refusing to publish an outdated detail version",
+                    {"submitted_for": body.detail_version,
+                     "current_detail_version": latest["version"]},
+                )
+            mask_row = self._mask_row(conn, quarter, latest["version"])
+            if mask_row is None:
+                older = conn.execute(
+                    "SELECT mask_version, detail_version FROM mask_plans "
+                    "WHERE quarter=? AND detail_version<? "
+                    "ORDER BY detail_version DESC LIMIT 1",
+                    (quarter, latest["version"]),
+                ).fetchone()
+                if older is not None:
+                    raise conflict(
+                        "mask_plan_superseded",
+                        "the masking plan belongs to an outdated detail "
+                        "version and cannot be published",
+                        {
+                            "superseded_mask_version": older["mask_version"],
+                            "superseded_detail_version":
+                                older["detail_version"],
+                            "current_detail_version": latest["version"],
+                            "hint": "review the mask again, then publish",
+                        },
+                    )
+                raise conflict(
+                    "mask_required",
+                    "no masking plan exists for the current detail version",
+                    {"detail_version": latest["version"]},
+                )
+            if body.mask_version is not None and \
+                    body.mask_version != mask_row["mask_version"]:
+                raise conflict(
+                    "stale_mask_version",
+                    "the masking plan changed since it was reviewed",
+                    {"submitted_for": body.mask_version,
+                     "current_mask_version": mask_row["mask_version"]},
+                )
+
+            detail_version = latest["version"]
+            reviewed_mask_version = mask_row["mask_version"]
+            values = json.loads(latest["values_json"])
+            must_public = _cells(json.loads(latest["must_public"]))
+            masked = _cells(json.loads(mask_row["cells_json"]))
+            row_totals = json.loads(q["row_totals"])
+            col_totals = json.loads(q["col_totals"])
+            district_labels = json.loads(q["district_labels"])
+            industry_labels = json.loads(q["industry_labels"])
+        finally:
+            conn.close()
+
+        # Phase 2: re-validate the snapshot without any lock held.
+        validation = suppression.analyze(values, masked, must_public)
+        if not validation.valid:
+            conflict_cells = [
+                {"row": r, "col": c} for r, c in validation.conflict_cells
+            ]
+            raise conflict(
+                "mask_conflict",
+                "publication blocked: the masking does not protect every "
+                "masked cell (or conflicts with the must-public list)",
+                {
+                    "cells": conflict_cells,
+                    "issues": [i.as_dict() for i in validation.issues],
+                    "detail_version": detail_version,
+                    "mask_version": reviewed_mask_version,
+                    "hint": "call the suppression-advice endpoint to "
+                            "obtain supplementary cells to mask",
+                },
+            )
+
+        # Phase 3: commit under a short write lock.  Both versions are
+        # re-checked even if the request supplied neither, so a detail or mask
+        # revised during the analysis is rejected instead of published under
+        # stale review, and nothing is written on conflict.
         conn = connect(self.db_path)
         try:
             with transaction(conn):
-                q = self._quarter_row(conn, quarter)
+                self._quarter_row(conn, quarter)
                 existing = self._bulletin_row(conn, quarter)
                 if existing is not None:
                     raise conflict(
@@ -504,79 +635,31 @@ class BulletinService:
                          "detail_version": existing["detail_version"]},
                     )
                 latest = self._latest_detail(conn, quarter)
-                if latest is None:
-                    raise ApiError(409, "detail_required",
-                                   "submit a detail version before publishing")
-                if body.detail_version is not None and \
-                        body.detail_version != latest["version"]:
+                current_version = latest["version"] if latest else None
+                if current_version != detail_version:
                     raise conflict(
                         "stale_detail_version",
-                        "refusing to publish an outdated detail version",
-                        {"submitted_for": body.detail_version,
-                         "current_detail_version": latest["version"]},
+                        "the detail version changed while it was being "
+                        "reviewed for publication; reload and retry",
+                        {"reviewed_detail_version": detail_version,
+                         "current_detail_version": current_version},
                     )
-                mask_row = self._mask_row(conn, quarter, latest["version"])
-                if mask_row is None:
-                    older = conn.execute(
-                        "SELECT mask_version, detail_version FROM mask_plans "
-                        "WHERE quarter=? AND detail_version<? "
-                        "ORDER BY detail_version DESC LIMIT 1",
-                        (quarter, latest["version"]),
-                    ).fetchone()
-                    if older is not None:
-                        raise conflict(
-                            "mask_plan_superseded",
-                            "the masking plan belongs to an outdated detail "
-                            "version and cannot be published",
-                            {
-                                "superseded_mask_version": older["mask_version"],
-                                "superseded_detail_version":
-                                    older["detail_version"],
-                                "current_detail_version": latest["version"],
-                                "hint": "review the mask again, then publish",
-                            },
-                        )
-                    raise conflict(
-                        "mask_required",
-                        "no masking plan exists for the current detail version",
-                        {"detail_version": latest["version"]},
-                    )
-                if body.mask_version is not None and \
-                        body.mask_version != mask_row["mask_version"]:
+                mask_row = self._mask_row(conn, quarter, detail_version)
+                current_mask_version = (
+                    mask_row["mask_version"] if mask_row else None
+                )
+                if current_mask_version != reviewed_mask_version:
                     raise conflict(
                         "stale_mask_version",
-                        "the masking plan changed since it was reviewed",
-                        {"submitted_for": body.mask_version,
-                         "current_mask_version": mask_row["mask_version"]},
-                    )
-
-                values = json.loads(latest["values_json"])
-                must_public = _cells(json.loads(latest["must_public"]))
-                masked = _cells(json.loads(mask_row["cells_json"]))
-                row_totals = json.loads(q["row_totals"])
-                col_totals = json.loads(q["col_totals"])
-
-                validation = suppression.analyze(values, masked, must_public)
-                if not validation.valid:
-                    conflict_cells = [
-                        {"row": r, "col": c} for r, c in validation.conflict_cells
-                    ]
-                    raise conflict(
-                        "mask_conflict",
-                        "publication blocked: the masking does not protect every "
-                        "masked cell (or conflicts with the must-public list)",
-                        {
-                            "cells": conflict_cells,
-                            "issues": [i.as_dict() for i in validation.issues],
-                            "detail_version": latest["version"],
-                            "mask_version": mask_row["mask_version"],
-                            "hint": "call the suppression-advice endpoint to "
-                                    "obtain supplementary cells to mask",
-                        },
+                        "the masking plan changed while it was being reviewed "
+                        "for publication; reload and retry",
+                        {"reviewed_mask_version": reviewed_mask_version,
+                         "current_mask_version": current_mask_version},
                     )
 
                 payload = self._build_payload(
-                    quarter, q, values, row_totals, col_totals, masked,
+                    quarter, district_labels, industry_labels, values,
+                    row_totals, col_totals, masked,
                 )
                 try:
                     conn.execute(
@@ -585,8 +668,8 @@ class BulletinService:
                         "VALUES(?,?,?,?,?,?)",
                         (
                             quarter,
-                            latest["version"],
-                            mask_row["mask_version"],
+                            detail_version,
+                            reviewed_mask_version,
                             json.dumps(payload),
                             now(),
                             token_id,
@@ -607,10 +690,8 @@ class BulletinService:
         return payload
 
     @staticmethod
-    def _build_payload(quarter, q, values, row_totals, col_totals,
-                       masked) -> dict[str, Any]:
-        districts = json.loads(q["district_labels"])
-        industries = json.loads(q["industry_labels"])
+    def _build_payload(quarter, districts, industries, values,
+                       row_totals, col_totals, masked) -> dict[str, Any]:
         visible = [
             [None if (i, j) in masked else values[i][j]
              for j in range(len(industries))]
@@ -669,7 +750,8 @@ class BulletinService:
             })
         return out
 
-    def get_admin_state(self, quarter: str) -> dict[str, Any]:
+    def get_admin_state(self, quarter: str,
+                        include_analysis: bool = True) -> dict[str, Any]:
         """Editor-only view: versions plus validation of the current mask."""
         from .db import connect
 
@@ -711,7 +793,7 @@ class BulletinService:
                 bulletin["detail_version"] if bulletin else None
             ),
         }
-        if latest and mask_row:
+        if latest and mask_row and include_analysis:
             values = json.loads(latest["values_json"])
             must_public = _cells(json.loads(latest["must_public"]))
             masked = _cells(json.loads(mask_row["cells_json"]))
